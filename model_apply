@@ -1,0 +1,48 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu May 16 09:29:49 2024
+
+@author: Thijs Endendijk
+"""
+
+import os
+import numpy as np
+import pandas as pd
+import time
+
+from DIFREI_repository import DIFREI_catastrophe_model # code if you don't know the EAL for each property
+from DIFREI_repository import DIFREI_EAL # code when you know the EAL for each property
+
+#%% LTV, and damage functions
+LTV_PD_function = pd.read_excel("path_to_PD_LTV_function")
+LTV_PD_function.sort_values(by='LTV',inplace=True)
+
+residential = pd.read_excel("path_to_residential_damage_curves")
+commercial = pd.read_excel("path_to_commercial_damage_curves")
+
+loan_data = pd.read_excel("path_to_loan_data")
+
+#%%% APPROACH WITHOUT CATASTROPHE MODULE (SO EAL ALREADY KNOWN)
+DIFREI_EAL = DIFREI_EAL(loan_data, LTV_PD_function, r_discount=0.03, panic_factor=0.1, CC_factor=0.1)
+# use the dataframe, the LTV-PD function, discount rate, panic factor (panic means over estimation by 1/0.1= factor 10), climate change factor
+# default in the function: n=30, sentimental year return back to original = 5, event-based price reduction=0.105 and no structural FDM on the building level considered
+
+
+#%%% APPROACH WITH CATASTROPHE MODULE
+#%%
+flood_scenarios = ['LIWO_10','LIWO_100','LIWO_1000','Durg_1000', 'Durg_10000','Durg_100000','Durg_1000000',]              # create list with all the flood scenarios, this is an example
+scenario_groups_primary = ['flood_IJm', 'flood_Durg', 'flood_Am']                                                         # relevant for the Dutch context, leave empty if outside of NL
+scenario_groups = ['flood_LIWO','flood_Durg']                                                                             # groups if you work with different scenarios
+secondary_scenarios = ['LIWO_10','LIWO_100','LIWO_1000']                                                                  # use for international context
+primary_scenarios = ['Durg_1000', 'Durg_10000',                                                                           # relevant for the Dutch context, leave empty if outside of NL
+                       'Durg_100000','Durg_1000000']
+flood_groups = {
+        'flood_LIWO': ['flood_LIWO_10', 'flood_LIWO_100', 'flood_LIWO_1000'],                                             # dictionary with scenario_group + scenario
+        'flood_Durg': ['flood_Durg_1000', 'flood_Durg_10000', 'flood_Durg_100000', 'flood_Durg_1000000']}
+
+
+#%%
+DIFREI_catastrophe_model = DIFREI_catastrophe_model(loan_data, flood_scenarios, scenario_groups_primary, scenario_groups, secondary_scenarios, primary_scenarios, flood_groups,
+                LTV_PD_function, commercial, residential, panic_factor=0.1, CC_factor=0.1)
+# use the dataframe, the LTV-PD function, discount rate, panic factor (panic means over estimation by 1/0.1= factor 10), climate change factor
+# default in the function: n=30, sentimental year return back to original = 5, event-based price reduction=0.105 and no structural FDM on the building level considered
