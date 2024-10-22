@@ -1,0 +1,901 @@
+"""
+Created on Tue Mar 26 11:54:07 2024
+
+@author: Thijs Endendijk
+"""
+
+###############################################################################################################################################
+###############################################################################################################################################
+#################################################### Risk- and event-based approach ###########################################################
+###############################################################################################################################################
+###############################################################################################################################################
+
+#%% Define function for both risk- and event-based
+def DIFREI_catastrophe_model(data, flood_scenarios, scenario_groups_primary, scenario_groups, secondary_scenarios, primary_scenarios, flood_groups,
+                LTV_PD_function, commercial, residential, r_discount=0.03, CC_factor=0.1, panic_factor=0.2, r_interest=0.03, n=30, sentimental_years=5, 
+                sentimental_reduction=0.105, FDM_structural=0):
+    import numpy as np
+    import pandas as pd
+    from scipy.interpolate import interp1d
+    import math
+    import scipy.stats as stats
+        
+    #%%#################
+    # INPUT DATA AND ASSUMPTIONS
+    ###################
+
+    #%% account for adaptation on the building level
+    data['FDM_structural'] = FDM_structural # TURN OFF WHEN ACCOUNTING FOR ADAPTATION
+    
+    
+    #%% determine monthly annuity // Monthly annuity= debt* r/((1-(1+r)^-n)
+    r_interest_monthly = r_interest/12
+    n_months = n*12
+    data['annuity_original'] = data['original_loan']*r_interest_monthly/((1-(1+r_interest_monthly)**(-n_months)))
+    
+    #%% calculate outstanding loan
+    def calculate_outstanding_loan(row):
+        if row['mortgage_annuity'] == 1:
+            return row['annuity_original'] * (1 - 1 / (1 + r_interest_monthly) ** (row['mortgage_duration'] * 12)) / r_interest_monthly
+        elif row['mortgage_interestonly'] == 1:
+            return row['original_loan']
+        else:
+            return None
+    
+    data['outstanding_loan'] = data.apply(calculate_outstanding_loan, axis=1)
+    
+    #%%################################
+    #### PHYSICAL RISK CALCULATION ####
+    ###################################
+    #%% Determine flood risk, can turn use the Endendijk et al. (2023) functions by turning that code on and the interpolate value function off
+    
+    def interpolate_value(lookup_df, x):
+        return np.interp(x, lookup_df['Depth'], lookup_df['Damage ratio'])
+
+    # Iterate through the flood scenarios and apply the lookup
+    for scenario in flood_scenarios:
+        data[f'damratio_{scenario}'] = data.apply(
+            lambda row: interpolate_value(commercial if row['commercial'] == 1 else residential, row[scenario]),
+            axis=1
+        )
+    for scenario in flood_scenarios:
+        data[f'damage_{scenario}'] = data[f'damratio_{scenario}'] * data['rebuilding_value']
+
+    ''' Endendijk et al. (2023) functions
+    for scenario in flood_scenarios:
+        data[f'damratio_{scenario}'] = 0 
+        data[f'damratio_{scenario}'] = np.where((data[scenario] > 0), (0.24 + 0.015 * np.sqrt(data[scenario]))-0.222*data['FDM_structural'], data[f'damratio_{scenario}'])
+    for scenario in flood_scenarios:
+        data[f'damage_{scenario}'] = data[f'damratio_{scenario}'] * data['rebuilding_value']
+    '''
+    # Calculate EAL for every type of flooding.
+    
+    def calculate_EAL(data, RPs_yr, prefix):
+        probs = [1 / rp for rp in RPs_yr]
+        eal_col = f'EAL_{prefix}'
+        flood_prefix = f'{prefix}'
+        data[eal_col] = data.apply(
+            lambda z: np.abs(np.trapz([z[f'damage_{flood_prefix}_{rp}'] for rp in RPs_yr], x=probs)), axis=1
+        )
+        data = data.sort_values(by=eal_col, ascending=False)
+    
+    # Iterate over flood groups
+    for prefix, scenarios in flood_groups.items():
+        RPs_yr = [int(scenario.split('_')[-1]) for scenario in scenarios]
+        calculate_EAL(data, np.array(RPs_yr), prefix)
+    
+    total_EAL_primary = 0
+    for scenario in scenario_groups_primary:
+        total_EAL_primary += data[f'EAL_{scenario}']
+    data['EAL_flood_primary'] = total_EAL_primary
+    
+    #%% EAL CC
+    def calculate_EAL(data, RPs_yr, prefix, CC_factor=CC_factor):
+        adjusted_RPs_yr = [rp * CC_factor for rp in RPs_yr]
+        probs = [1 / rp for rp in adjusted_RPs_yr]
+        eal_col = f'EAL_CC_{prefix}'
+        flood_prefix = f'{prefix}'
+        data[eal_col] = data.apply(
+            lambda z: np.abs(np.trapz([z[f'damage_{flood_prefix}_{rp}'] for rp in RPs_yr], x=probs)), axis=1
+        )
+        data = data.sort_values(by=eal_col, ascending=False)
+    
+    # Iterate over flood groups
+    for prefix, scenarios in flood_groups.items():
+        RPs_yr = [int(scenario.split('_')[-1]) for scenario in scenarios]
+        calculate_EAL(data, np.array(RPs_yr), prefix)
+    
+    total_EAL_primary_CC = 0
+    for scenario in scenario_groups_primary:
+        total_EAL_primary_CC += data[f'EAL_CC_{scenario}']
+    data['EAL_CC_flood_primary'] = total_EAL_primary_CC
+    
+    #%% EAL panic
+    def calculate_EAL(data, RPs_yr, prefix, panic_factor=panic_factor):
+        adjusted_RPs_yr = [rp * panic_factor for rp in RPs_yr]
+        probs = [1 / rp for rp in adjusted_RPs_yr]
+        eal_col = f'EAL_panic_{prefix}'
+        flood_prefix = f'{prefix}'
+        data[eal_col] = data.apply(
+            lambda z: np.abs(np.trapz([z[f'damage_{flood_prefix}_{rp}'] for rp in RPs_yr], x=probs)), axis=1
+        )
+        data = data.sort_values(by=eal_col, ascending=False)
+    
+    # Iterate over flood groups
+    for prefix, scenarios in flood_groups.items():
+        RPs_yr = [int(scenario.split('_')[-1]) for scenario in scenarios]
+        calculate_EAL(data, np.array(RPs_yr), prefix)
+    
+    total_EAL_primary_panic = 0
+    for scenario in scenario_groups_primary:
+        total_EAL_primary_panic += data[f'EAL_panic_{scenario}']
+    data['EAL_panic_flood_primary'] = total_EAL_primary_panic
+    
+    #%% repair costs assets - 100% if protected by dikes, 40% if outside dike ring (numbers from Endendijk et al., 2023)
+    for scenario in flood_scenarios:
+        repair_col_name = f'repair_costs_y0_{scenario}'
+        damage_col_name = f'damage_{scenario}'
+        data[repair_col_name] = data.apply(lambda row: row[damage_col_name] * 0.4 if row['dike_ring'] == 0 else row[damage_col_name], axis=1)
+        
+    for scenario in flood_scenarios:
+        for year in range(1, sentimental_years + 1):  # Excluding y0 and starting from y1
+            column_name_year = f'repair_costs_y{year}_{scenario}'
+            
+            # Set the values of y1 to y5 to 0
+            data[column_name_year] = 0   
+        
+    #%% EAL repair costs
+    def calculate_EAL(data, RPs_yr, prefix):
+        probs = [1 / rp for rp in RPs_yr]
+        eal_col = f'EAL_repair_costs_{prefix}'
+        flood_prefix = f'{prefix}'
+        data[eal_col] = data.apply(
+            lambda z: np.abs(np.trapz([z[f'repair_costs_y0_{flood_prefix}_{rp}'] for rp in RPs_yr], x=probs)), axis=1
+        )
+        data = data.sort_values(by=eal_col, ascending=False)
+    
+    # Iterate over flood groups
+    for prefix, scenarios in flood_groups.items():
+        RPs_yr = [int(scenario.split('_')[-1]) for scenario in scenarios]
+        calculate_EAL(data, np.array(RPs_yr), prefix)
+    
+    total_EAL_primary_repair = 0
+    for scenario in scenario_groups_primary:
+        total_EAL_primary_repair += data[f'EAL_repair_costs_{scenario}']
+    data['EAL_repair_costs_flood_primary'] = total_EAL_primary_repair
+    
+        
+    #%%#################
+    # ASSET DEPRECIATION 
+    ###################
+    
+    # Create dummy variables for each flood scenario group
+    for group, scenarios in flood_groups.items():
+        data[group] = data[scenarios].apply(lambda row: any(row > 0), axis=1).astype(int)
+    
+    ## create variable if flooded in a primary scenario
+    data['flood_primary'] = data[scenario_groups_primary].max(axis=1)
+    
+    # Convert the result to integer (0 or 1)
+    data['flood_primary'] = data['flood_primary'].astype(int)
+    
+    
+    #%% RATIONAL PRICING
+    #set initial discount based on Bosker et al. (2018) and Mutlu et al. (2023) ONLY APPLIED FOR LIMBURG PROPERTIES IF THEY ARE AT RISK. 
+    data['flood_secondary'] = data.apply(
+        lambda row: any(row[f'flood_{scenario}'] > 0 for scenario in secondary_scenarios),
+        axis=1
+    ).astype(int)
+    
+    data['WOZ_adjusted'] = data.apply(
+        lambda row: row['WOZ'] if row['flood_secondary'] == 0
+        else row['WOZ'] * 0.944 if row['dike_ring'] == 0
+        else row['WOZ'] * 0.99,
+        axis=1
+    )    
+    
+    #%% Determine NPV based on EAL
+    def calculate_npv(data, scenario_group, r, n):
+        for year in range(n + 1):
+            col_name = f'EAL_{scenario_group}_calc_{year}'
+            data[col_name] = data[f'EAL_{scenario_group}'] / ((1 + r) ** year)
+    
+        calc_columns = [f'EAL_{scenario_group}_calc_{year}' for year in range(n + 1)]
+        data[f'EAL_{scenario_group}_NPV'] = data[calc_columns].sum(axis=1)
+        data.drop(calc_columns, axis=1, inplace=True)
+
+    # Call the function for each scenario group
+    for group in scenario_groups:
+        calculate_npv(data, group, r_discount, n)
+            
+    #%% Determine NPV based on EAL under CC (see CC conditions above)
+    def calculate_npv(data, scenario_group, r, n):
+        for year in range(n + 1):
+            col_name = f'EAL_CC_{scenario_group}_calc_{year}'
+            data[col_name] = data[f'EAL_CC_{scenario_group}'] / ((1 + r) ** year)
+    
+        calc_columns = [f'EAL_CC_{scenario_group}_calc_{year}' for year in range(n + 1)]
+        data[f'EAL_CC_{scenario_group}_NPV'] = data[calc_columns].sum(axis=1)
+        data.drop(calc_columns, axis=1, inplace=True)
+    
+    for group in scenario_groups:
+        calculate_npv(data, group, r_discount, n)
+        
+    #%% Determine NPV based on EAL under panic (see panic conditions above)
+    def calculate_npv(data, scenario_group, r, n):
+        for year in range(n + 1):
+            col_name = f'EAL_panic_{scenario_group}_calc_{year}'
+            data[col_name] = data[f'EAL_panic_{scenario_group}'] / ((1 + r) ** year)
+    
+        calc_columns = [f'EAL_panic_{scenario_group}_calc_{year}' for year in range(n + 1)]
+        data[f'EAL_panic_{scenario_group}_NPV'] = data[calc_columns].sum(axis=1)
+        data.drop(calc_columns, axis=1, inplace=True)
+    
+    for group in scenario_groups:
+        calculate_npv(data, group, r_discount, n)    
+     
+    #%% RATIONAL PRICES. 
+    
+    for group in scenario_groups:
+        rational_value = data['WOZ_adjusted'] - data[f'EAL_{group}_NPV']
+        data[f'rational_value_{group}'] = rational_value.apply(lambda x: max(x, 0))
+    
+    for group in scenario_groups:
+        rational_value_CC = data['WOZ_adjusted'] - data[f'EAL_CC_{group}_NPV']
+        data[f'rational_value_CC_{group}'] = rational_value_CC.apply(lambda x: max(x, 0))
+    
+    for group in scenario_groups:
+        rational_value_panic = data['WOZ_adjusted'] - data[f'EAL_panic_{group}_NPV']
+        data[f'rational_value_panic_{group}'] = rational_value_panic.apply(lambda x: max(x, 0))
+    
+    #%% SENTIMENTAL PRICING
+    #Sentiment-driven market 
+    # market price - 6-20.2% after flood, disappears after 5-6 years.
+    
+    #%%
+    reduction_factors = []
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            if year == 0:
+                reduction_factor = sentimental_reduction
+            elif year == sentimental_years:
+                reduction_factor = 0
+            else:
+                reduction_factor = reduction_factors[-1] / 1.6
+    
+            reduction_factors.append(reduction_factor)
+    
+            column_name = f'sentimental_price_y{year}_{scenario}'
+            data[column_name] = (1 - reduction_factor) * data['WOZ']
+            data.loc[data[scenario] == 0, column_name] = data['WOZ']
+    
+    #%%#################
+    # BUSINESS INTERRUPTION AND LOSSES
+    ###################
+    
+    #%% predict business interruption losses (used to determine default probabilities)
+    def calculate_and_update_comm_interruption(data, column_name, LIWO_column_name):
+        data[column_name] = -4.15226 + 0.148 * data[LIWO_column_name]
+        data[column_name] = data[column_name].apply(lambda x: max(x, 0))
+        data.loc[(data['commercial'] == 0) & (data['primary'] == 1), column_name] = pd.NA
+    
+    for scenario in secondary_scenarios:        # business interruption for secondary scenarios
+        calculate_and_update_comm_interruption(data, f'bus_interruption_flood_{scenario}', f'flood_{scenario}')
+    data['duration_flood'] = np.where(np.isnan(data['durationGR']), 0, data['duration_flood'])
+    
+    for scenario in primary_scenarios:
+        data[f'bus_interruption_flood_{scenario}'] = data['duration_flood'] * ((data['primary'] == 1) & (data[f'flood_{scenario}'] >0) & data['commercial'] == 1).astype(int)
+    
+    #%% Revenue loss ratios. Depend on business interruption after flooding
+    
+    for scenario in flood_scenarios:
+        col_interruption = f'bus_interruption_{scenario}'
+        col_revenue_loss = f'revenue_lossratio_{scenario}'
+    
+        data[col_revenue_loss] = 0.0059 * data[col_interruption] + 0.038935
+        data[col_revenue_loss] = data[col_revenue_loss].where(data[col_interruption] != 0, 0)   # revenue loss ratio
+        data[col_revenue_loss] = data[col_revenue_loss].fillna(0)  # Replace NaN with 0
+    
+    
+    #%%#################
+    # LTV AND LGD
+    ###################
+    #%% LTV (insurance and no insurance) . Still include sentiment-driven market
+    
+    data['LTV_original'] = data['outstanding_loan']/data['WOZ']        # LTV in original state
+    
+    for location in scenario_groups:
+        data[f'LTV_rational_{location}'] = data['outstanding_loan'] / data[f'rational_value_{location}']
+        data[f'LTV_rational_CC_{location}'] = data['outstanding_loan'] / data[f'rational_value_CC_{location}']
+        data[f'LTV_rational_panic_{location}'] = data['outstanding_loan'] / data[f'rational_value_panic_{location}']
+    
+    
+    #%%
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_price = f'sentimental_price_y{year}_{scenario}'
+            column_name_LTV = f'LTV_sentiment_y{year}_{scenario}'        
+            data[column_name_LTV] = data['outstanding_loan'] / data[column_name_price]
+    
+                     
+    #%%#################
+    # MORTGAGE HOLDER'S CREDIT STANDING
+    ###################
+    
+    #%% PD baseline based on DNB approach. 
+    interpolated_function = interp1d(LTV_PD_function['LTV'], LTV_PD_function['PD'], kind='linear', fill_value="extrapolate")
+    data['PD_baseline'] = data['LTV_original'].apply(lambda x: float(interpolated_function(x)))
+    
+    for location in scenario_groups:
+        data[f'PD_DNB_rational_{location}'] = data[f'LTV_rational_{location}'].apply(lambda x: float(interpolated_function(x)))
+        data[f'PD_DNB_rational_CC_{location}'] = data[f'LTV_rational_CC_{location}'].apply(lambda x: float(interpolated_function(x)))
+        data[f'PD_DNB_rational_panic_{location}'] = data[f'LTV_rational_panic_{location}'].apply(lambda x: float(interpolated_function(x)))
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_LTV = f'LTV_sentiment_y{year}_{scenario}'
+            column_name_PD_DNB = f'PD_DNB_sentiment_y{year}_{scenario}'
+            
+            data[column_name_PD_DNB] = data[column_name_LTV].apply(lambda x: float(interpolated_function(x)))
+    
+    
+    #%% if stranded asset (rational_value==0, then set LTV to max from DNB study. 1.6.). To calculate PD. LGD set to 1 when calculating risks
+    
+    for group in scenario_groups:
+        data.loc[data[f'rational_value_{group}'] == 0, f'PD_DNB_rational_{group}'] = 0.05
+        data.loc[data[f'rational_value_CC_{group}'] == 0, f'PD_DNB_rational_CC_{group}'] = 0.05
+        data.loc[data[f'rational_value_panic_{group}'] == 0, f'PD_DNB_rational_panic_{group}'] = 0.05
+        
+    #%% Default prob. Based on Kousky et al. 9% used because it was the maximum value for the minor damage category
+    
+    # ONLY INCLUDE DIKE_RING = 0 IF ONLY LOOKING AT REGIONAL WATERWAYS
+    
+    def calculate_default_prob(row, dam_column):            # default probability
+        dam_ratio = row[dam_column]                         # dike_ring ==1 indicates not insured
+        if 0 < dam_ratio < 0.09 and row['dike_ring'] == 0:
+            return row['PD_baseline'] * 0.94        # can also be 1 to capture no effect.
+        elif dam_ratio >= 0.09 and row['dike_ring'] == 0:
+            return row['PD_baseline'] * 2.96
+        elif dam_ratio == 0:
+            return row['PD_baseline']
+        elif 0 < dam_ratio < 0.09 and row['dike_ring'] == 1:
+            return row['PD_baseline'] * 1.44
+        elif dam_ratio >= 0.09 and row['dike_ring'] == 1:
+            return row['PD_baseline'] * 2.63
+    
+    for scenario in flood_scenarios:
+        column_name = 'PD_US_sentiment_y0_' + scenario
+        dam_column = 'damratio_' + scenario
+        
+        data[column_name] = data.apply(lambda row: calculate_default_prob(row, dam_column), axis=1)
+    
+    #%% update default prob for commercial real estate
+    for scenario in flood_scenarios:
+        column_name = 'PD_US_sentiment_y0_' + scenario
+        flooded_column = scenario.replace('flood_', 'flooded_')  # Adjusting the flooded column name for flood dummy
+        loss_ratio_column = 'revenue_lossratio_' + scenario
+        
+        data[column_name] = np.where(data['commercial'] == 1,
+                                     data['PD_baseline'] + 0.00910 * data[flooded_column] + 0.00387 * data[loss_ratio_column],
+                                     data[column_name])
+    
+    #%% return back to baseline PD
+    reduction_factors = []
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            if year == 0:
+                reduction_factor = (data[f'PD_US_sentiment_y0_{scenario}']-data['PD_baseline'])/data['PD_baseline']
+            elif year == sentimental_years:
+                reduction_factor = 0
+            else:
+                reduction_factor = reduction_factors[-1] / 1.6
+    
+            reduction_factors.append(reduction_factor)
+    
+            column_name = f'PD_US_sentiment_y{year}_{scenario}'
+            data[column_name] = (1 + reduction_factor) * data['PD_baseline']
+            data.loc[data[scenario] == 0, column_name] = data['PD_baseline']    
+    
+    #%%#################
+    # INTEREST LOSSES
+    ###################
+    
+    #%% lost interest at default
+    data['lost_interest_default'] = 0
+    condition1 = data['mortgage_annuity'] == 1 #             ## lost interest default annuity mortgage
+    data.loc[condition1, 'lost_interest_default'] = data.loc[condition1, 'annuity_original'] * data.loc[condition1, 'mortgage_duration'] * 12 - data.loc[condition1, 'outstanding_loan']
+    condition2 = data['mortgage_interestonly'] == 1         ## lost interest default interest only mortgage
+    data.loc[condition2, 'lost_interest_default'] = data.loc[condition2, 'outstanding_loan'] * r_interest * data.loc[condition2, 'mortgage_duration']
+    
+    
+    #%% lost interest DNB default approach
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_PD_DNB_sentiment = f'PD_DNB_sentiment_y{year}_{scenario}'
+            column_name_lost_interest_increase = f'lost_interest_increase_DNB_y{year}_{scenario}'
+            
+            data[column_name_lost_interest_increase] = (data['lost_interest_default'] * data[column_name_PD_DNB_sentiment]) - (data['lost_interest_default'] * data['PD_baseline'])
+    
+    #%% lost interest US default approach
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_PD_US_sentiment = f'PD_US_sentiment_y{year}_{scenario}'
+            column_name_lost_interest_increase = f'lost_interest_increase_US_y{year}_{scenario}'
+            
+            data[column_name_lost_interest_increase] = (data['lost_interest_default'] * data[column_name_PD_US_sentiment]) - (data['lost_interest_default'] * data['PD_baseline'])
+    
+    #%%#################
+    # LGD
+    ###################
+    
+    data['LGD_original'] = ((data['LTV_original'] - data['sales_ratio'])/ data['LTV_original']).apply(lambda x: max(x, 0))
+    
+    for location in scenario_groups:
+        data[f'LGD_rational_{location}'] = ((data[f'LTV_rational_{location}'] - data['sales_ratio']) / data[f'LTV_rational_{location}']).apply(lambda x: max(x, 0))
+        data[f'LGD_rational_CC_{location}'] = ((data[f'LTV_rational_CC_{location}'] - data['sales_ratio']) / data[f'LTV_rational_CC_{location}']).apply(lambda x: max(x, 0))
+        data[f'LGD_rational_panic_{location}'] = ((data[f'LTV_rational_panic_{location}'] - data['sales_ratio']) / data[f'LTV_rational_panic_{location}']).apply(lambda x: max(x, 0))
+    
+    for location in scenario_groups:
+        data.loc[data[f'rational_value_{location}'] == 0, f'LGD_rational_{location}'] = 1       # set LGD to 1 for stranded assets
+        data.loc[data[f'rational_value_CC_{location}'] == 0, f'LGD_rational_CC_{location}'] = 1
+        data.loc[data[f'rational_value_panic_{location}'] == 0, f'LGD_rational_panic_{location}'] = 1        
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_LTV = f'LTV_sentiment_y{year}_{scenario}'
+            column_name_LGD = f'LGD_sentiment_y{year}_{scenario}'
+            
+            data[column_name_LGD] = ((data[column_name_LTV] - data['sales_ratio']) / data[column_name_LTV]).apply(lambda x: max(x, 0))
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years +1):  # set LGD to 1 for stranded assets
+            data.loc[data[f'sentimental_price_y{year}_{scenario}']==0, f'LGD_sentiment_y{year}_{scenario}']=1 
+    
+    #%%#################
+    # MORTGAGE CREDIT RISK
+    ###################
+    #%%
+    data['creditrisk_original'] = ((data['outstanding_loan']*data['LGD_original']))*data['PD_baseline']      # baseline DefaultRisk
+    
+    for group in scenario_groups:
+        data[f'creditrisk_rational_{group}'] = ((data['outstanding_loan'] * data[f'LGD_rational_{group}'])) * data[f'PD_DNB_rational_{group}'] # rational pricing without flooding
+        for group in scenario_groups:
+            data[f'creditrisk_rational_CC_{group}'] = ((data['outstanding_loan'] * data[f'LGD_rational_CC_{group}'])) * data[f'PD_DNB_rational_CC_{group}'] # rational pricing without flooding
+            data[f'creditrisk_rational_panic_{group}'] = ((data['outstanding_loan'] * data[f'LGD_rational_panic_{group}'])) * data[f'PD_DNB_rational_panic_{group}'] # rational pricing without flooding
+    
+    
+    #%% Sentimental market credit risk - US approach
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_LGD = f'LGD_sentiment_y{year}_{scenario}'
+            column_name_PD_US = f'PD_US_sentiment_y{year}_{scenario}'
+            column_name_creditrisk = f'creditrisk_sentiment_US_y{year}_{scenario}'
+            
+            data[column_name_creditrisk] = data['outstanding_loan'] * data[column_name_LGD] * data[column_name_PD_US]
+    
+    #%% Sentimental market credit risk - DNB approach
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_LGD = f'LGD_sentiment_y{year}_{scenario}'
+            column_name_PD_US = f'PD_DNB_sentiment_y{year}_{scenario}'
+            column_name_creditrisk = f'creditrisk_sentiment_DNB_y{year}_{scenario}'
+            
+            data[column_name_creditrisk] = data['outstanding_loan'] * data[column_name_LGD] * data[column_name_PD_US]
+    
+    
+    #%% Increase credit risk rational market
+    
+    for group in scenario_groups:           # increase in credit risk in rational market
+        data[f'creditrisk_increase_rational_{group}'] = data[f'creditrisk_rational_{group}'] - data['creditrisk_original']
+        data[f'creditrisk_increase_rational_CC_{group}'] = data[f'creditrisk_rational_CC_{group}'] - data['creditrisk_original']
+        data[f'creditrisk_increase_rational_panic_{group}'] = data[f'creditrisk_rational_panic_{group}'] - data['creditrisk_original']
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_creditrisk_sentiment = f'creditrisk_sentiment_US_y{year}_{scenario}'
+            column_name_creditrisk_increase = f'creditrisk_increase_sentiment_US_y{year}_{scenario}'
+            
+            data[column_name_creditrisk_increase] = data[column_name_creditrisk_sentiment] - data['creditrisk_original']
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_creditrisk_sentiment = f'creditrisk_sentiment_DNB_y{year}_{scenario}'
+            column_name_creditrisk_increase = f'creditrisk_increase_sentiment_DNB_y{year}_{scenario}'
+            
+            data[column_name_creditrisk_increase] = data[column_name_creditrisk_sentiment] - data['creditrisk_original']
+    
+    
+    #%%#################
+    # CAPITAL REQUIREMENTS - LGD and PD + opportunity costs
+    ################### 
+    #%%% formula to determine capital requirements
+    def capital_requirement(lgd, pd, tenure):
+        madjcoeff = 1.5
+        tsub = 2.5
+        R=0.15
+        b=(0.11852 - 0.05478 * math.log(pd))**2
+        p1 = (stats.norm.ppf(pd) + R**0.5 * stats.norm.ppf(0.999)) / ((1 - R)**0.5)
+        req_no_adj = lgd * stats.norm.cdf(p1) - lgd * pd
+        return req_no_adj * (1 + ((tenure - tsub) * b)) / (1- madjcoeff * b)
+    
+    # baseline capital requirements
+    data['capital_requirement_baseline'] = data.apply(lambda row: capital_requirement((row['LGD_original']), row['PD_baseline'], row['mortgage_duration']) * row['outstanding_loan'], axis=1) 
+    
+    #%% Cap Req - Rational + No Flood
+       
+    for group in scenario_groups:           # Rational + No Flood
+        data[f'capital_requirement_rational_{group}'] = data.apply(lambda row: capital_requirement((row[f'LGD_rational_{group}']), row[f'PD_DNB_rational_{group}'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+        data[f'add_cap_req_rational_{group}'] = data[f'capital_requirement_rational_{group}'] - data['capital_requirement_baseline']
+        data[f'opportunity_costs_rational_{group}'] = data[f'add_cap_req_rational_{group}'] * r_interest          # opportunity costs
+    
+    #%% Cap Req - Rational + No Flood + CC
+        
+    '''
+    for group in scenario_groups:           # Rational + No Flood + CC
+        data[f'capital_requirement_rational_CC_{group}'] = data.apply(lambda row: capital_requirement((row[f'LGD_rational_CC_{group}']), row[f'PD_DNB_rational_CC_{group}'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+        data[f'add_cap_req_rational_CC_{group}'] = data[f'capital_requirement_rational_CC_{group}'] - data['capital_requirement_baseline']
+        data[f'opportunity_costs_rational_CC_{group}'] = data[f'add_cap_req_rational_CC_{group}'] * r_interest          # opportunity costs
+    '''
+    #%% Cap Req - Rational + No Flood + panic
+    for group in scenario_groups:           # Rational + No Flood + panic
+        data[f'capital_requirement_rational_panic_{group}'] = data.apply(lambda row: capital_requirement((row[f'LGD_rational_panic_{group}']),row[f'PD_DNB_rational_panic_{group}'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+        data[f'add_cap_req_rational_panic_{group}'] = data[f'capital_requirement_rational_panic_{group}'] - data['capital_requirement_baseline']
+        data[f'opportunity_costs_rational_panic_{group}'] = data[f'add_cap_req_rational_panic_{group}'] * r_interest          # opportunity costs
+    
+    #%% capital requirements sentiment - US approach
+    
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_LGD = f'LGD_sentiment_y{year}_{scenario}'
+            column_name_PD_US = f'PD_US_sentiment_y{year}_{scenario}'
+            column_name_capital_req = f'capital_requirement_sentiment_US_y{year}_{scenario}'
+            column_name_add_cap_req = f'add_cap_req_sentiment_US_y{year}_{scenario}'
+            column_name_opportunity_costs = f'opportunity_costs_sentiment_US_y{year}_{scenario}'
+            
+            data[column_name_capital_req] = data.apply(
+                lambda row: capital_requirement(
+                    row[column_name_LGD], 
+                    row[column_name_PD_US], 
+                    row['mortgage_duration']) * row['outstanding_loan'], 
+                axis=1)
+            
+            data[column_name_add_cap_req] = data[column_name_capital_req] - data['capital_requirement_baseline']
+            
+            data[column_name_opportunity_costs] = data[column_name_add_cap_req] * r_interest
+
+    
+    #%% capital requirements sentiment - DNB approach
+    for scenario in flood_scenarios:
+        for year in range(sentimental_years + 1):  # Including y0 to y5
+            column_name_LGD = f'LGD_sentiment_y{year}_{scenario}'
+            column_name_PD_DNB = f'PD_DNB_sentiment_y{year}_{scenario}'
+            column_name_capital_req = f'capital_requirement_sentiment_DNB_y{year}_{scenario}'
+            column_name_add_cap_req = f'add_cap_req_sentiment_DNB_y{year}_{scenario}'
+            column_name_opportunity_costs = f'opportunity_costs_sentiment_DNB_y{year}_{scenario}'
+            
+            data[column_name_capital_req] = data.apply(
+                lambda row: capital_requirement(
+                    row[column_name_LGD], 
+                    row[column_name_PD_DNB], 
+                    row['mortgage_duration']) * row['outstanding_loan'], 
+                axis=1)
+            
+            data[column_name_add_cap_req] = data[column_name_capital_req] - data['capital_requirement_baseline']
+            
+            data[column_name_opportunity_costs] = data[column_name_add_cap_req] * r_interest
+    
+    
+    #%%#################
+    # LOST RENT 
+    ###################
+    
+    for scenario in secondary_scenarios:
+        data['recovery_flood_' + scenario] = np.where((data['damratio_flood_' + scenario] >= 0.03),
+                                                 round(-11.821 + 140.844 * np.sqrt(data['damratio_flood_' + scenario])),
+                                                 0)
+    for scenario in primary_scenarios:
+        data['recovery_flood_' + scenario] = np.where(data['flooded_' + scenario] == 1,
+                                                 data['duration_flood'],
+                                                 0)
+    
+    #%% LOST returns
+    for scenario in flood_scenarios:
+        data[f'ROA_loss_y0_{scenario}']=data['WOZ']*data['ROA']/365*data[f'recovery_{scenario}']
+    
+    for scenario in flood_scenarios:
+        for year in range(1, sentimental_years + 1):  # Excluding y0 and starting from y1
+            column_name_year = f'ROA_loss_y{year}_{scenario}'
+            
+            # Set the values of y1 to y5 to 0
+            data[column_name_year] = 0
+    
+    def calculate_EAL_ROA(data, RPs_yr, prefix):
+        probs = [1 / rp for rp in RPs_yr]
+        eal_col = f'EAL_ROA_loss_{prefix}'
+        flood_prefix = f'{prefix}'
+        data[eal_col] = data.apply(
+            lambda z: np.abs(np.trapz([z[f'ROA_loss_y0_{flood_prefix}_{rp}'] for rp in RPs_yr], x=probs)), axis=1
+        )
+        data = data.sort_values(by=eal_col, ascending=False)
+    
+    for prefix, scenarios in flood_groups.items():
+        RPs_yr = [int(scenario.split('_')[-1]) for scenario in scenarios]
+        calculate_EAL_ROA(data, np.array(RPs_yr), prefix)
+    
+    total_EAL_primary = 0
+    for scenario in scenario_groups_primary:
+        total_EAL_primary += data[f'EAL_ROA_loss_{scenario}']
+    data['EAL_ROA_loss_flood_primary'] = total_EAL_primary
+    
+    
+    return data
+
+#%% APPROACH WITHOUT THE DIFFERENT EVENTS
+
+
+    #%% 1. import python packages
+def DIFREI_EAL(data, LTV_PD_function, r_discount, CC_factor=0.1, panic_factor=0.2, r_interest=0.03, n=30, sentimental_years=5, 
+              sentimental_reduction=0.105, FDM_structural=0):
+    import math
+    import scipy.stats as stats
+    from scipy.interpolate import interp1d
+        
+    #%%#################
+    # INPUT DATA AND ASSUMPTIONS
+    ###################
+    
+    
+    #%% Extra conditions
+    data['FDM_structural'] = FDM_structural # TURN OFF WHEN ACCOUNTING FOR ADAPTATION
+    r_interest_monthly = r_interest/12
+    n_months = n*12
+    
+    #%% determine monthly annuity // Monthly annuity= debt* r/((1-(1+r)^-n)
+    data['annuity_original'] = data['original_loan']*r_interest_monthly/((1-(1+r_interest_monthly)**(-n_months)))
+    
+    #%% calculate outstanding loan
+    def calculate_outstanding_loan(row):
+        if row['mortgage_annuity'] == 1:
+            return row['annuity_original'] * (1 - 1 / (1 + r_interest_monthly) ** (row['mortgage_duration'] * 12)) / r_interest_monthly
+        elif row['mortgage_interestonly'] == 1:
+            return row['original_loan']
+        else:
+            return None
+    
+    data['outstanding_loan'] = data.apply(calculate_outstanding_loan, axis=1)
+    
+    
+    #%%
+    data['EAL'] = data['EAL_ratio'] * data['rebuilding_value']
+    data['EAL_panic'] = data['EAL_ratio'] * data['rebuilding_value'] * (1/panic_factor)
+    
+        
+    #%%#################
+    # ASSET DEPRECIATION 
+    ###################
+    
+    #%% RATIONAL PRICING
+    #set initial discount based on Bosker et al. (2018) and Mutlu et al. (2023) ONLY APPLIED FOR LIMBURG PROPERTIES IF THEY ARE AT RISK. 
+    
+    data['WOZ_adjusted'] = data.apply(
+        lambda row: row['WOZ'] if row['EAL_ratio'] == 0
+        else row['WOZ'] * 0.944 if row['dike_ring'] == 0
+        else row['WOZ'] * 0.99,
+        axis=1
+    )
+    
+    #%% Determine NPV based on EAL
+    for year in range(n + 1):
+        col_name = f'EAL_calc_{year}'
+        data[col_name] = data['EAL'] / ((1 + r_discount) ** year)
+    
+    calc_columns = [f'EAL_calc_{year}' for year in range(n + 1)]
+    data['EAL_NPV'] = data[calc_columns].sum(axis=1)
+    data.drop(calc_columns, axis=1, inplace=True)
+    
+    for year in range(n + 1):
+        col_name = f'EAL_calc_{year}'
+        data[col_name] = data['EAL'] / ((1 + (r_discount-0.01)) ** year)
+    
+    calc_columns = [f'EAL_calc_{year}' for year in range(n + 1)]
+    data['EAL_NPV_rlow'] = data[calc_columns].sum(axis=1)
+    data.drop(calc_columns, axis=1, inplace=True)
+      
+    for year in range(n + 1):
+        col_name = f'EAL_calc_{year}'
+        data[col_name] = data['EAL'] / ((1 + (r_discount+0.01)) ** year)
+    
+    calc_columns = [f'EAL_calc_{year}' for year in range(n + 1)]
+    data['EAL_NPV_rhigh'] = data[calc_columns].sum(axis=1)
+    data.drop(calc_columns, axis=1, inplace=True)
+    
+    for year in range(n + 1):
+        col_name = f'EAL_calc_{year}'
+        data[col_name] = data['EAL_panic'] / ((1 + r_discount) ** year)
+    
+    calc_columns = [f'EAL_calc_{year}' for year in range(n + 1)]
+    data['EAL_NPV_panic'] = data[calc_columns].sum(axis=1)
+    data.drop(calc_columns, axis=1, inplace=True)
+    
+    
+    #%% RATIONAL PRICES. 
+    
+    data['rational_value'] = data['WOZ_adjusted'] - data['EAL_NPV']
+    data['rational_value'] = data['rational_value'].apply(lambda x: max(x, 0))
+    
+    data['rational_value_rlow'] = data['WOZ_adjusted'] - data['EAL_NPV_rlow']
+    data['rational_value_rlow'] = data['rational_value_rlow'].apply(lambda x: max(x, 0))
+    
+    data['rational_value_rhigh'] = data['WOZ_adjusted'] - data['EAL_NPV_rhigh']
+    data['rational_value_rhigh'] = data['rational_value_rhigh'].apply(lambda x: max(x, 0))
+    
+    data['rational_value_panic'] = data['WOZ_adjusted'] - data['EAL_NPV_panic']
+    data['rational_value_panic'] = data['rational_value_panic'].apply(lambda x: max(x, 0))
+    
+    #%% Price reduction
+    
+    data['housing_price_reduction'] = data['rational_value'] - data['WOZ']
+    data['housing_price_reduction_rlow'] = data['rational_value_rlow'] - data['WOZ']
+    data['housing_price_reduction_rhigh'] = data['rational_value_rhigh'] - data['WOZ']
+    data['housing_price_reduction_panic'] = data['rational_value_panic'] - data['WOZ']
+    
+    #%%#################
+    # LTV AND LGD
+    ###################
+    #%% LTV 
+    data['LTV_original'] = data['outstanding_loan']/data['WOZ']        # LTV in original state
+    
+    data['LTV_rational_NL'] = data['outstanding_loan']/data['rational_value']
+    
+    data['LTV_rational_NL_rlow'] = data['outstanding_loan']/data['rational_value_rlow']
+    data['LTV_rational_NL_rhigh'] = data['outstanding_loan']/data['rational_value_rhigh']
+    
+    data['LTV_rational_NL_panic'] = data['outstanding_loan']/data['rational_value_panic']
+    
+    #%%
+    ranges = [(0, 0.7), (0.7, 0.8), (0.8, 0.9), (0.9, 1), (1, float('inf'))]
+    
+    # Initialize counts
+    counts = [0] * len(ranges)
+    
+    # Count occurrences in each range
+    for val in data['LTV_original']:
+        for i, (start, end) in enumerate(ranges):
+            if start <= val < end:
+                counts[i] += 1
+                break
+    
+    # Calculate percentages
+    total = len(data['LTV_original'])
+    percentages = [(count / total) * 100 for count in counts]
+    
+    # Print the percentages
+    for i, (start, end) in enumerate(ranges):
+        print(f"Percentage of df['LTV_original'] between {start} and {end}: {percentages[i]:.2f}%")
+                     
+    #%%#################
+    # MORTGAGE HOLDER'S CREDIT STANDING
+    ###################
+    
+    #%% PD baseline based on DNB approach. 
+    interpolated_function = interp1d(LTV_PD_function['LTV'], LTV_PD_function['PD'], kind='linear', fill_value="extrapolate")
+    data['PD_baseline'] = data['LTV_original'].apply(lambda x: float(interpolated_function(x)))
+    
+    data['PD_rational_NL'] = data['LTV_rational_NL'].apply(lambda x: float(interpolated_function(x)))
+    
+    #data['PD_rational_NL_rlow'] = data['LTV_rational_NL_rlow'].apply(lambda x: float(interpolated_function(x)))
+    #data['PD_rational_NL_rhigh'] = data['LTV_rational_NL_rhigh'].apply(lambda x: float(interpolated_function(x)))
+    
+    data['PD_rational_NL_panic'] = data['LTV_rational_NL_panic'].apply(lambda x: float(interpolated_function(x)))
+    
+    #%% if stranded asset (rational_value==0, then set LTV to max from DNB study. 1.6.). To calculate PD. LGD set to 1 when calculating risks
+    
+    data.loc[data['rational_value'] == 0, 'PD_rational_NL'] = 0.05
+        
+    #data.loc[data['rational_value_rlow'] == 0, 'PD_rational_NL_rlow'] = 0.05
+    #data.loc[data['rational_value_rhigh'] == 0, 'PD_rational_NL_rhigh'] = 0.05
+    
+    data.loc[data['rational_value_panic'] == 0, 'PD_rational_NL_panic'] = 0.05
+    
+    
+    #%%
+    
+    data['perc_value_reduction'] = (data['rational_value']-data['WOZ'])/data['WOZ']*100
+    #data['perc_value_reduction_rlow'] = (data['rational_value_rlow']-data['WOZ'])/data['WOZ']*100
+    #data['perc_value_reduction_rhigh'] = (data['rational_value_rhigh']-data['WOZ'])/data['WOZ']*100
+    data['perc_value_reduction_panic'] = (data['rational_value_panic']-data['WOZ'])/data['WOZ']*100
+    
+    #%% lost interest at default
+    data['lost_interest_default'] = 0
+    condition1 = data['mortgage_annuity'] == 1 #             ## lost interest default annuity mortgage
+    data.loc[condition1, 'lost_interest_default'] = data.loc[condition1, 'annuity_original'] * data.loc[condition1, 'mortgage_duration'] * 12 - data.loc[condition1, 'outstanding_loan']
+    condition2 = data['mortgage_interestonly'] == 1         ## lost interest default interest only mortgage
+    data.loc[condition2, 'lost_interest_default'] = data.loc[condition2, 'outstanding_loan'] * r_interest * data.loc[condition2, 'mortgage_duration']
+    
+    #%%#################
+    # MORTGAGE CREDIT RISK
+    ###################
+    data['LGD_original'] = ((data['LTV_original'] - data['sales_ratio'])/ data['LTV_original']).apply(lambda x: max(x, 0))
+    
+    data['LGD_rational_NL'] = ((data['LTV_rational_NL'] - data['sales_ratio']) / data['LTV_rational_NL']).apply(lambda x: max(x, 0))
+    data.loc[data['rational_value'] == 0, 'LGD_rational_NL'] = 1
+    
+    #data['LGD_rational_NL_rlow'] = ((data['LTV_rational_NL_rlow'] - data['sales_ratio']) / data['LTV_rational_NL_rlow']).apply(lambda x: max(x, 0))
+    #data.loc[data['rational_value_rlow'] == 0, 'LGD_rational_NL_rlow'] = 1
+    
+    #data['LGD_rational_NL_rhigh'] = ((data['LTV_rational_NL_rhigh'] - data['sales_ratio']) / data['LTV_rational_NL_rhigh']).apply(lambda x: max(x, 0))
+    #data.loc[data['rational_value_rhigh'] == 0, 'LGD_rational_NL_rhigh'] = 1
+    
+    data['LGD_rational_NL_panic'] = ((data['LTV_rational_NL_panic'] - data['sales_ratio']) / data['LTV_rational_NL_panic']).apply(lambda x: max(x, 0))
+    data.loc[data['rational_value_panic'] == 0, 'LGD_rational_NL_panic'] = 1
+    
+    #%%#################
+    # MORTGAGE CREDIT RISK
+    ###################
+    #%%
+    data['creditrisk_original'] = ((data['outstanding_loan']*data['LGD_original']))*data['PD_baseline']      # baseline DefaultRisk
+    
+    data['creditrisk_rational_NL'] = ((data['outstanding_loan']*data['LGD_rational_NL']))*data['PD_rational_NL']      # updated DefaultRisk
+    
+    #data['creditrisk_rational_NL_rlow'] = ((data['outstanding_loan']*data['LGD_rational_NL_rlow']))*data['PD_rational_NL_rlow']      
+    #data['creditrisk_rational_NL_rhigh'] = ((data['outstanding_loan']*data['LGD_rational_NL_rhigh']))*data['PD_rational_NL_rhigh']      
+    
+    data['creditrisk_rational_NL_panic'] = ((data['outstanding_loan']*data['LGD_rational_NL_panic']))*data['PD_rational_NL_panic']      # updated DefaultRisk
+    
+    
+    #%% Increase credit risk rational market
+    
+    data['creditrisk_increase_rational_NL'] = (data['creditrisk_rational_NL'] - data['creditrisk_original'])
+    #data['creditrisk_increase_rational_NL_rlow'] = (data['creditrisk_rational_NL_rlow'] - data['creditrisk_original'])
+    #data['creditrisk_increase_rational_NL_rhigh'] = (data['creditrisk_rational_NL_rhigh'] - data['creditrisk_original'])
+    data['creditrisk_increase_rational_NL'] = (data['creditrisk_rational_NL_panic'] - data['creditrisk_original'])
+    
+    
+    #%%#################
+    # CAPITAL REQUIREMENTS - LGD and PD + opportunity costs
+    ################### 
+    #%%% formula to determine capital requirements
+    def capital_requirement(lgd, pd, tenure):
+        madjcoeff = 1.5
+        tsub = 2.5
+        R=0.15
+        b=(0.11852 - 0.05478 * math.log(pd))**2
+        p1 = (stats.norm.ppf(pd) + R**0.5 * stats.norm.ppf(0.999)) / ((1 - R)**0.5)
+        req_no_adj = lgd * stats.norm.cdf(p1) - lgd * pd
+        return req_no_adj * (1 + ((tenure - tsub) * b)) / (1- madjcoeff * b)
+    
+    # baseline capital requirements
+    data['capital_requirement_baseline'] = data.apply(lambda row: capital_requirement((row['LGD_original']), row['PD_baseline'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+    
+    
+    #%% Cap Req - Rational + No Flood
+    data['capital_requirement_rational_NL'] = data.apply(lambda row: capital_requirement((row['LGD_rational_NL']), row['PD_rational_NL'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+    data['add_capital_requirement_rational_NL'] = data['capital_requirement_rational_NL'] - data['capital_requirement_baseline']
+    data['opportunity_costs_rational_NL'] = data['add_capital_requirement_rational_NL'] * r_interest
+    '''
+    
+    
+    data['capital_requirement_rational_NL_rlow'] = data.apply(lambda row: capital_requirement((row['LGD_rational_rlow']+), row['PD_rational_NL_rlow'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+    data['add_capital_requirement_rational_NL_rlow'] = data['capital_requirement_rational_NL_rlow'] - data['capital_requirement_baseline']
+    data['opportunity_costs_rational_NL_rlow'] = data['add_capital_requirement_rational_NL_rlow'] * r_interest
+    
+    data['capital_requirement_rational_NL_rhigh'] = data.apply(lambda row: capital_requirement((row['LGD_rational_rhigh']), row['PD_rational_NL_rhigh'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+    data['add_capital_requirement_rational_NL_rhigh'] = data['capital_requirement_rational_NL_rhigh'] - data['capital_requirement_baseline']
+    data['opportunity_costs_rational_NL_rhigh'] = data['add_capital_requirement_rational_NL_rhigh'] * r_interest
+    '''
+    
+    data['capital_requirement_rational_NL_panic'] = data.apply(lambda row: capital_requirement((row['LGD_rational_NL_panic']), row['PD_rational_NL_panic'], row['mortgage_duration']) * row['outstanding_loan'], axis=1)
+    data['add_capital_requirement_rational_NL_panic'] = data['capital_requirement_rational_NL_panic'] - data['capital_requirement_baseline']
+    data['opportunity_costs_rational_NL_panic'] = data['add_capital_requirement_rational_NL_panic'] * r_interest
+    
+    
+    
+    return data 
+
+
+
+
+
+
